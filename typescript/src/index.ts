@@ -8,7 +8,7 @@
 
 import { createHmac, timingSafeEqual } from 'crypto';
 
-export type Network = 'mpesa' | 'airtel';
+export type Network = 'mpesa' | 'airtel' | 'tkash';
 export type DestinationType = 'mobile' | 'till' | 'paybill' | 'bank';
 
 export interface ChargeParams {
@@ -39,6 +39,8 @@ export interface CheckoutParams {
 
 export interface PayoutParams {
   amountKes: number;
+  /** Or supply exact cents instead of amountKes; must be a multiple of 100. */
+  amountCents?: number;
   wallet?: string;
   channelId?: string;
   destinationType?: DestinationType;
@@ -71,6 +73,7 @@ export const WebhookEvents = {
   ChargeExpired: 'charge.expired',
   PayoutPaid: 'payout.paid',
   PayoutFailed: 'payout.failed',
+  WebhookTest: 'webhook.test',
 } as const;
 export type WebhookEvent = typeof WebhookEvents[keyof typeof WebhookEvents];
 
@@ -100,16 +103,45 @@ export function normalizePhone(phone: string): string | null {
   return /^254[17]\d{8}$/.test(p) ? p : null;
 }
 
-/** Convert shillings to integer cents, rounding to whole shillings first. */
+/** Convert shillings to cents, rounding up to the next whole shilling as the rail does for charges. */
 export function toCents(amountKes: number): number {
-  const kes = Math.round(Number(amountKes));
-  if (!Number.isFinite(kes) || kes < 1) throw new CyzoraError('Amount must be at least KES 1.');
+  const value = Number(amountKes);
+  if (!Number.isFinite(value)) throw new CyzoraError('Amount must be a number.');
+  const kes = Math.ceil(value);
+  if (kes < 1) throw new CyzoraError('Amount must be at least KES 1.');
   return kes * 100;
 }
 
 /** Convert integer cents back to shillings. */
 export function fromCents(cents: number): number {
   return Math.round(Number(cents || 0)) / 100;
+}
+
+/**
+ * Payout amounts are refused by the rail unless they are a multiple of 100 cents,
+ * so the SDK rejects fractional shillings instead of silently rounding them.
+ */
+function payoutCents(amountKes: number, amountCents?: number): number {
+  const cents = amountCents !== undefined ? Number(amountCents) : Number(amountKes) * 100;
+  if (!Number.isFinite(cents) || !Number.isInteger(cents) || cents % 100 !== 0) {
+    throw new CyzoraError('Payout amounts must be whole shillings (a multiple of 100 cents).');
+  }
+  if (cents < 1) throw new CyzoraError('Amount must be at least KES 1.');
+  return cents;
+}
+
+const env = (): Record<string, string | undefined> =>
+  typeof process !== 'undefined' && process.env ? process.env : {};
+
+interface RequestInitOptions {
+  method?: string;
+  body?: unknown;
+  idempotencyKey?: string;
+  query?: Record<string, string | number | undefined>;
+  /** Public endpoints such as statement verification need no secret key. */
+  auth?: boolean;
+  /** Return the exact response text (for CSV exports) instead of parsed JSON. */
+  raw?: boolean;
 }
 
 export class Cyzora {
@@ -122,11 +154,12 @@ export class Cyzora {
   constructor(opts: CyzoraOptions) {
     if (!opts?.secretKey) throw new CyzoraError('secretKey is required');
     this.secretKey = opts.secretKey;
-    this.baseUrl = (opts.baseUrl || 'https://api.cyzora.co.ke/api/v1').replace(/\/$/, '');
-    const secrets = opts.webhookSecrets
-      ? Array.isArray(opts.webhookSecrets) ? opts.webhookSecrets : [opts.webhookSecrets]
+    this.baseUrl = (opts.baseUrl || env().CYZORA_API_BASE || 'https://api.cyzora.co.ke/api/v1').replace(/\/$/, '');
+    const configured = opts.webhookSecrets ?? env().CYZORA_WEBHOOK_SECRET;
+    const secrets = configured
+      ? Array.isArray(configured) ? configured : String(configured).split(',')
       : [];
-    this.webhookSecrets = secrets.filter(Boolean);
+    this.webhookSecrets = secrets.map((s) => String(s).trim()).filter(Boolean);
     this.fetchImpl = opts.fetchImpl || fetch;
     this.maxRetries = opts.maxRetries ?? 2;
   }
@@ -138,16 +171,17 @@ export class Cyzora {
    *   cyzora.request('POST', '/charges', { body: {...}, idempotencyKey: 'k' })
    *   cyzora.request('GET', '/some-new-endpoint')
    */
-  request<T = any>(method: string, path: string, init: { body?: unknown; idempotencyKey?: string; query?: Record<string, string | number | undefined> } = {}): Promise<T> {
+  request<T = any>(method: string, path: string, init: Omit<RequestInitOptions, 'method'> = {}): Promise<T> {
     return this._request<T>(path, { ...init, method });
   }
 
-  private async _request<T = any>(path: string, init: { method?: string; body?: unknown; idempotencyKey?: string; query?: Record<string, string | number | undefined> } = {}): Promise<T> {
+  private async _request<T = any>(path: string, init: RequestInitOptions = {}): Promise<T> {
     const url = new URL(`${this.baseUrl}${path}`);
     if (init.query) {
       for (const [k, v] of Object.entries(init.query)) if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
     }
-    const headers: Record<string, string> = { 'X-API-Key': this.secretKey, Accept: 'application/json' };
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (init.auth !== false) headers['X-API-Key'] = this.secretKey;
     if (init.body !== undefined) headers['Content-Type'] = 'application/json';
     if (init.idempotencyKey) headers['Idempotency-Key'] = String(init.idempotencyKey).slice(0, 128);
     const method = init.method || (init.body !== undefined ? 'POST' : 'GET');
@@ -168,10 +202,13 @@ export class Cyzora {
       let data: any = {};
       if (text) { try { data = JSON.parse(text); } catch { data = { raw: text }; } }
       if (!res.ok) {
-        const transient = res.status >= 500 || res.status === 429;
+        // A 409 with an idempotency key means the earlier request is still being
+        // processed; the docs advise waiting and retrying with the same key.
+        const transient = res.status >= 500 || res.status === 429 || (res.status === 409 && !!init.idempotencyKey);
         if (transient && canRetry && attempt < this.maxRetries) { await sleep(2 ** attempt * 250); attempt++; continue; }
         throw new CyzoraError(data?.error || data?.message || `Cyzora request failed (${res.status})`, res.status, data);
       }
+      if (init.raw) return text as T;
       return data as T;
     }
   }
@@ -179,9 +216,11 @@ export class Cyzora {
   /** Send an M-Pesa STK prompt to a customer's phone. */
   async createCharge(p: ChargeParams) {
     const phone = normalizePhone(p.phone);
-    if (!phone) throw new CyzoraError('Enter a valid Safaricom phone number (e.g. 0712 345 678).');
-    const cents = p.amountCents !== undefined ? Number(p.amountCents) : toCents(p.amountKes);
-    if (!Number.isInteger(cents) || cents < 100) throw new CyzoraError('Amount must be a whole number of shillings, at least KES 1.');
+    if (!phone) throw new CyzoraError('Enter a valid M-Pesa phone number (e.g. 0712 345 678).');
+    const cents = p.amountCents !== undefined
+      ? Math.ceil(Number(p.amountCents) / 100) * 100
+      : toCents(p.amountKes);
+    if (!Number.isFinite(cents) || !Number.isInteger(cents) || cents < 100) throw new CyzoraError('Amount must be a whole number of shillings, at least KES 1.');
     return this._request('/charges', {
       method: 'POST',
       idempotencyKey: p.idempotencyKey,
@@ -198,6 +237,11 @@ export class Cyzora {
 
   getCharge(chargeId: string) {
     return this._request(`/charges/${encodeURIComponent(chargeId)}`);
+  }
+
+  /** Download charges as CSV; from/to are dates such as 2026-10-01. */
+  exportCharges(query: { from?: string; to?: string; status?: string } = {}) {
+    return this._request<string>('/charges/export', { query, raw: true });
   }
 
   /** Hosted checkout session (redirect flow) instead of an STK push. */
@@ -225,24 +269,50 @@ export class Cyzora {
 
   /** Send money out of the platform balance to a mobile/till/paybill/bank destination. */
   async createPayout(p: PayoutParams) {
-    const cents = toCents(p.amountKes);
+    const cents = payoutCents(p.amountKes, p.amountCents);
     if (cents < PAYOUT_MIN_CENTS) throw new CyzoraError('The smallest payout is KES 30.');
     const body: Record<string, unknown> = { amount: cents };
-    if (p.wallet) body.wallet = p.wallet;
+    const wallet = p.wallet || env().CYZORA_PAYOUT_WALLET;
+    if (wallet) body.wallet = wallet;
     if (p.channelId) body.channel_id = p.channelId;
     else {
       const type = p.destinationType || 'mobile';
       body.destination_type = type;
-      if (type === 'mobile') body.phone = normalizePhone(p.phone || '') || p.phone;
-      else if (type === 'till') body.short_code = p.shortCode;
-      else if (type === 'paybill') { body.short_code = p.shortCode; body.account_ref = p.accountRef; }
-      else if (type === 'bank') { body.bank_code = p.bankCode; body.account_number = p.accountNumber; body.account_name = p.accountName; }
+      const require = (field: string, value: unknown) => {
+        if (value === undefined || value === null || String(value) === '') throw new CyzoraError(`${field} is required for ${type} payouts.`);
+      };
+      if (type === 'mobile') {
+        const phone = normalizePhone(p.phone || '');
+        if (!phone) throw new CyzoraError('phone must be a valid M-Pesa number for mobile payouts.');
+        body.phone = phone;
+      } else if (type === 'till') {
+        require('shortCode', p.shortCode);
+        body.short_code = p.shortCode;
+      } else if (type === 'paybill') {
+        require('shortCode', p.shortCode);
+        require('accountRef', p.accountRef);
+        body.short_code = p.shortCode;
+        body.account_ref = p.accountRef;
+      } else if (type === 'bank') {
+        require('bankCode', p.bankCode);
+        require('accountNumber', p.accountNumber);
+        require('accountName', p.accountName);
+        body.bank_code = p.bankCode;
+        body.account_number = p.accountNumber;
+        body.account_name = p.accountName;
+      } else {
+        throw new CyzoraError('destinationType must be mobile, till, paybill or bank.');
+      }
     }
     return this._request('/payouts', { method: 'POST', idempotencyKey: p.idempotencyKey, body });
   }
 
   getPayout(payoutId: string) {
     return this._request(`/payouts/${encodeURIComponent(payoutId)}`);
+  }
+
+  listPayouts(query: { from?: string; to?: string; status?: string } = {}) {
+    return this._request('/payouts', { query });
   }
 
   /** Balances (in cents) for collections, collections_pending and payouts wallets. */
@@ -258,8 +328,17 @@ export class Cyzora {
     return this._request('/payout-banks');
   }
 
-  payoutFeePreview(amountKes: number, destinationType: DestinationType = 'mobile') {
-    return this._request('/payouts/fee-preview', { query: { amount: toCents(amountKes), destination_type: destinationType } });
+  /**
+   * Preview the provider fee. The rail expects `destination` (not `destination_type`)
+   * and the same wallet the payout will use, otherwise the preview can differ.
+   */
+  payoutFeePreview(amountKes: number, destinationType: DestinationType = 'mobile', wallet?: string) {
+    return this._request('/payouts/fee-preview', { query: { amount: payoutCents(amountKes), destination: destinationType, wallet } });
+  }
+
+  /** Verify a statement code without a secret key; the code is 12 characters. */
+  verifyStatement(code: string) {
+    return this._request(`/public/statements/verify/${encodeURIComponent(code)}`, { auth: false });
   }
 
   /**
@@ -269,14 +348,14 @@ export class Cyzora {
    */
   verifyWebhookSignature(rawBody: string | Buffer, signature: string | null | undefined): boolean {
     if (!this.webhookSecrets.length || !signature || !rawBody) return false;
-    const body = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
-    const sig = String(signature).trim();
+    // HMAC must cover the exact bytes received; decoding and re-encoding a buffer
+    // would change the signature for payloads that are not valid UTF-8.
+    const body = typeof rawBody === 'string' ? Buffer.from(rawBody, 'utf8') : Buffer.from(rawBody);
+    const sig = Buffer.from(String(signature).trim(), 'utf8');
     return this.webhookSecrets.some((secret) => {
       try {
-        const expected = createHmac('sha256', secret).update(body).digest('hex');
-        const a = Buffer.from(expected, 'utf8');
-        const b = Buffer.from(sig, 'utf8');
-        return a.length === b.length && timingSafeEqual(a, b);
+        const expected = Buffer.from(createHmac('sha256', secret).update(body).digest('hex'), 'utf8');
+        return expected.length === sig.length && timingSafeEqual(expected, sig);
       } catch {
         return false;
       }
@@ -288,16 +367,23 @@ export class Cyzora {
    * one call. Throws CyzoraError if the signature is invalid or the body is not
    * JSON. `rawBody` must be the exact bytes received.
    */
-  constructWebhookEvent(rawBody: string | Buffer, signature: string | null | undefined): any {
+  constructWebhookEvent(rawBody: string | Buffer, signature: string | null | undefined, eventHeader?: string | null): any {
     if (!this.verifyWebhookSignature(rawBody, signature)) {
       throw new CyzoraError('Webhook signature verification failed', 401);
     }
     const body = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
+    let event: any;
     try {
-      return JSON.parse(body);
+      event = JSON.parse(body);
     } catch {
       throw new CyzoraError('Webhook body is not valid JSON', 400);
     }
+    // The rail also sends X-Cyzora-Event. When supplied, require it to agree with
+    // the body so a mismatched header cannot be used to misroute an event.
+    if (eventHeader && event?.event !== eventHeader) {
+      throw new CyzoraError('Webhook event header does not match the body', 400);
+    }
+    return event;
   }
 }
 

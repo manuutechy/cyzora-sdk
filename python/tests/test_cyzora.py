@@ -1,13 +1,42 @@
 import hashlib
 import hmac
 import json
+import os
 import unittest
+from unittest.mock import patch
 
-from cyzora import Cyzora, CyzoraError, normalize_phone, to_cents, from_cents, PAYOUT_MIN_CENTS
+from cyzora import (
+    Cyzora,
+    CyzoraError,
+    from_cents,
+    normalize_phone,
+    to_cents,
+    to_payout_cents,
+    PAYOUT_MIN_CENTS,
+    WEBHOOK_EVENTS,
+)
 
 
 def sign(secret: str, body: bytes) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+class FakeResponse:
+    def __init__(self, body, status=200):
+        self.body = body.encode() if isinstance(body, str) else body
+        self.status = status
+
+    def read(self):
+        return self.body
+
+    def getcode(self):
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 class HelpersTest(unittest.TestCase):
@@ -22,13 +51,23 @@ class HelpersTest(unittest.TestCase):
 
     def test_cents(self):
         self.assertEqual(to_cents(2500), 250000)
-        self.assertEqual(to_cents(2500.4), 250000)  # rounds to whole shillings
+        # The docs require odd cents to be rounded up to the next shilling.
+        self.assertEqual(to_cents(2500.4), 250100)
         self.assertEqual(from_cents(250000), 2500.0)
         with self.assertRaises(CyzoraError):
             to_cents(0)
 
+    def test_payout_cents_rejects_fractional_shillings(self):
+        self.assertEqual(to_payout_cents(1500), 150000)
+        for amount in (1500.5, 1500.01):
+            with self.assertRaises(CyzoraError):
+                to_payout_cents(amount)
+
     def test_payout_minimum_constant(self):
         self.assertEqual(PAYOUT_MIN_CENTS, 3000)
+
+    def test_webhook_events_include_test_event(self):
+        self.assertEqual(WEBHOOK_EVENTS["webhook_test"], "webhook.test")
 
 
 class WebhookTest(unittest.TestCase):
@@ -47,11 +86,16 @@ class WebhookTest(unittest.TestCase):
         self.assertFalse(self.client.verify_webhook_signature(b"", "deadbeef"))
 
     def test_construct_event_parses_when_valid(self):
-        payload = {"event": "payout.paid", "data": {"id": "po_1", "amount": 150000}}
+        payload = {"event": "payout.paid", "charge_id": "ch_1", "amount": 150000}
         body = json.dumps(payload).encode()
-        event = self.client.construct_webhook_event(body, sign("whsec_a", body))
+        event = self.client.construct_webhook_event(body, sign("whsec_a", body), "payout.paid")
         self.assertEqual(event["event"], "payout.paid")
-        self.assertEqual(event["data"]["amount"], 150000)
+        self.assertEqual(event["amount"], 150000)
+
+    def test_event_header_must_match_body(self):
+        body = b'{"event":"charge.succeeded"}'
+        with self.assertRaises(CyzoraError):
+            self.client.construct_webhook_event(body, sign("whsec_a", body), "payout.paid")
 
     def test_construct_event_rejects_bad_signature(self):
         body = b'{"event":"charge.succeeded"}'
@@ -73,6 +117,61 @@ class ConstructionTest(unittest.TestCase):
         c = Cyzora("sk_live_x", webhook_secret="whsec_only")
         body = b'{"event":"charge.failed"}'
         self.assertTrue(c.verify_webhook_signature(body, sign("whsec_only", body)))
+
+    def test_environment_defaults(self):
+        with patch.dict(os.environ, {
+            "CYZORA_API_BASE": "https://example.test/api/v1/",
+            "CYZORA_WEBHOOK_SECRET": "whsec_one, whsec_two",
+        }):
+            c = Cyzora("sk_live_x")
+        self.assertEqual(c.base_url, "https://example.test/api/v1")
+        self.assertEqual(c.webhook_secrets, ["whsec_one", "whsec_two"])
+
+
+class RequestTest(unittest.TestCase):
+    def setUp(self):
+        self.client = Cyzora("sk_live_x", base_url="https://example.test/api/v1")
+
+    def test_charge_payload_and_headers(self):
+        response = FakeResponse('{"id":"chg_1","status":"pending"}')
+        with patch("urllib.request.urlopen", return_value=response) as call:
+            self.client.create_charge(250.4, "0712345678", network="tkash", idempotency_key="INV-1")
+        req = call.call_args.args[0]
+        self.assertEqual(req.full_url, "https://example.test/api/v1/charges")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(req.get_header("X-api-key"), "sk_live_x")
+        self.assertEqual(req.get_header("Idempotency-key"), "INV-1")
+        self.assertEqual(json.loads(req.data), {
+            "amount": 25100, "phone": "254712345678", "network": "tkash",
+        })
+
+    def test_payout_requires_destination_fields(self):
+        with patch("urllib.request.urlopen", return_value=FakeResponse("{}")):
+            with self.assertRaises(CyzoraError):
+                self.client.create_payout(1500, destination_type="paybill", short_code="100000")
+
+    def test_fee_preview_uses_destination_parameter(self):
+        with patch("urllib.request.urlopen", return_value=FakeResponse("{}")) as call:
+            self.client.payout_fee_preview(2500, "paybill", "collections")
+        self.assertEqual(
+            call.call_args.args[0].full_url,
+            "https://example.test/api/v1/payouts/fee-preview?amount=250000&destination=paybill&wallet=collections",
+        )
+
+    def test_statement_verification_sends_no_api_key(self):
+        with patch("urllib.request.urlopen", return_value=FakeResponse('{"valid":true}')) as call:
+            result = self.client.verify_statement("K7PX3MZQ9H2D")
+        req = call.call_args.args[0]
+        self.assertTrue(result["valid"])
+        self.assertEqual(req.full_url, "https://example.test/api/v1/public/statements/verify/K7PX3MZQ9H2D")
+        self.assertIsNone(req.get_header("X-api-key"))
+
+    def test_export_returns_raw_csv(self):
+        csv = "date,amount\n2026-10-01,2500.00\n"
+        with patch("urllib.request.urlopen", return_value=FakeResponse(csv)) as call:
+            result = self.client.export_charges({"from": "2026-10-01", "status": "succeeded"})
+        self.assertEqual(result, csv)
+        self.assertIn("status=succeeded", call.call_args.args[0].full_url)
 
 
 if __name__ == "__main__":

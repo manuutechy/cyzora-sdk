@@ -6,3 +6,6 @@ __pycache__/
 vendor/
 *.egg-info/
 .DS_Store
+
+# Local, untracked API reference supplied for SDK development.
+Cyzora-API-Docs.pdf

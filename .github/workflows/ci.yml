@@ -32,6 +32,7 @@ jobs:
           node-version: "20"
       - run: npm install --no-audit --no-fund
       - run: npx tsc --noEmit -p tsconfig.json
+      - run: npm test
 
   php:
     name: PHP SDK
@@ -42,6 +43,7 @@ jobs:
         with:
           php-version: "8.2"
       - run: php -l php/src/Client.php
+      - run: php php/tests/ClientTest.php
 
   go:
     name: Go SDK

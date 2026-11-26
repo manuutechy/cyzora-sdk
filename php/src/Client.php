@@ -35,6 +35,7 @@ class Client
     /** Known webhook event names. The rail evolves, so also compare raw event strings. */
     public const WEBHOOK_EVENTS = [
         'charge.succeeded', 'charge.failed', 'charge.expired', 'payout.paid', 'payout.failed',
+        'webhook.test',
     ];
 
     private string $secretKey;
@@ -53,12 +54,14 @@ class Client
             throw new CyzoraException('secretKey is required');
         }
         $this->secretKey = $secretKey;
-        $this->baseUrl = rtrim($options['baseUrl'] ?? self::DEFAULT_BASE_URL, '/');
+        $baseUrl = $options['baseUrl'] ?? (getenv('CYZORA_API_BASE') ?: self::DEFAULT_BASE_URL);
+        $this->baseUrl = rtrim((string)$baseUrl, '/');
         $this->timeout = (int)($options['timeout'] ?? 30);
         $this->maxRetries = (int)($options['maxRetries'] ?? 2);
         $ws = $options['webhookSecret'] ?? null;
         if ($ws === null) {
-            $this->webhookSecrets = [];
+            $configured = getenv('CYZORA_WEBHOOK_SECRET');
+            $this->webhookSecrets = $configured ? array_values(array_filter(array_map('trim', explode(',', $configured)))) : [];
         } elseif (is_array($ws)) {
             $this->webhookSecrets = array_values(array_filter($ws));
         } else {
@@ -81,13 +84,27 @@ class Client
         return preg_match('/^254[17]\d{8}$/', $p) === 1 ? $p : null;
     }
 
+    /** Round up to the next whole shilling, as the rail does for charges and checkout. */
     public static function toCents($amountKes): int
     {
-        $kes = (int)round((float)$amountKes);
+        $kes = (int)ceil((float)$amountKes);
         if ($kes < 1) {
             throw new CyzoraException('Amount must be at least KES 1.');
         }
         return $kes * 100;
+    }
+
+    /** Payouts are refused unless the amount is a whole number of shillings. */
+    public static function toPayoutCents($amountKes, ?int $amountCents = null): int
+    {
+        $cents = $amountCents !== null ? (float)$amountCents : (float)$amountKes * 100;
+        if (floor($cents) != $cents || (int)$cents % 100 !== 0) {
+            throw new CyzoraException('Payout amounts must be whole shillings (a multiple of 100 cents).');
+        }
+        if ($cents < 1) {
+            throw new CyzoraException('Amount must be at least KES 1.');
+        }
+        return (int)$cents;
     }
 
     public static function fromCents($cents): float
@@ -99,9 +116,11 @@ class Client
     /**
      * @param array<string,mixed>|null $body
      * @param array<string,mixed>|null $query
-     * @return array<string,mixed>
+     * @param bool $auth Send the secret key; public endpoints need no key.
+     * @param bool $raw Return the response text (CSV exports) instead of decoded JSON.
+     * @return array<string,mixed>|string
      */
-    private function request(string $path, string $method = 'GET', ?array $body = null, ?string $idempotencyKey = null, ?array $query = null): array
+    private function request(string $path, string $method = 'GET', ?array $body = null, ?string $idempotencyKey = null, ?array $query = null, bool $auth = true, bool $raw = false)
     {
         $url = $this->baseUrl . $path;
         if ($query) {
@@ -110,7 +129,10 @@ class Client
                 $url .= '?' . http_build_query($clean);
             }
         }
-        $headers = ['X-API-Key: ' . $this->secretKey, 'Accept: application/json'];
+        $headers = ['Accept: application/json'];
+        if ($auth) {
+            $headers[] = 'X-API-Key: ' . $this->secretKey;
+        }
         $payload = null;
         if ($body !== null) {
             $headers[] = 'Content-Type: application/json';
@@ -152,14 +174,16 @@ class Client
                 $data = is_array($decoded) ? $decoded : ['raw' => $text];
             }
             if ($status < 200 || $status >= 300) {
-                $transient = $status >= 500 || $status === 429;
+                // A 409 with an idempotency key means the first request is still
+                // being processed; the docs advise waiting and retrying with it.
+                $transient = $status >= 500 || $status === 429 || ($status === 409 && $idempotencyKey !== null);
                 if ($transient && $canRetry && $attempt < $this->maxRetries) { $attempt++; usleep((int)(250000 * (2 ** ($attempt - 1)))); continue; }
                 curl_close($ch);
                 $msg = $data['error'] ?? $data['message'] ?? ('Cyzora request failed (' . $status . ')');
                 throw new CyzoraException((string)$msg, $status, $data);
             }
             curl_close($ch);
-            return $data;
+            return $raw ? $text : $data;
         }
     }
 
@@ -169,11 +193,11 @@ class Client
      *
      * @param array<string,mixed>|null $body
      * @param array<string,mixed>|null $query
-     * @return array<string,mixed>
+     * @return array<string,mixed>|string
      */
-    public function rawRequest(string $method, string $path, ?array $body = null, ?string $idempotencyKey = null, ?array $query = null): array
+    public function rawRequest(string $method, string $path, ?array $body = null, ?string $idempotencyKey = null, ?array $query = null, bool $auth = true, bool $raw = false)
     {
-        return $this->request($path, $method, $body, $idempotencyKey, $query);
+        return $this->request($path, $method, $body, $idempotencyKey, $query, $auth, $raw);
     }
 
     // -- charges ----------------------------------------------------------
@@ -185,9 +209,9 @@ class Client
     {
         $normalized = self::normalizePhone($phone);
         if ($normalized === null) {
-            throw new CyzoraException('Enter a valid Safaricom phone number (e.g. 0712 345 678).');
+            throw new CyzoraException('Enter a valid M-Pesa phone number (e.g. 0712 345 678).');
         }
-        $cents = $options['amountCents'] ?? self::toCents($amountKes);
+        $cents = isset($options['amountCents']) ? (int)(ceil((float)$options['amountCents'] / 100) * 100) : self::toCents($amountKes);
         if ((int)$cents < 100) {
             throw new CyzoraException('Amount must be a whole number of shillings, at least KES 1.');
         }
@@ -212,6 +236,12 @@ class Client
     public function getCharge(string $chargeId): array
     {
         return $this->request('/charges/' . rawurlencode($chargeId));
+    }
+
+    /** Download charges as CSV; from/to are dates such as 2026-10-01. */
+    public function exportCharges(?array $query = null): string
+    {
+        return (string)$this->request('/charges/export', 'GET', null, null, $query, true, true);
     }
 
     /**
@@ -246,35 +276,53 @@ class Client
 
     // -- payouts ----------------------------------------------------------
     /**
-     * @param array{wallet?:string, channelId?:string, destinationType?:string, phone?:string, shortCode?:string, accountRef?:string, bankCode?:string, accountNumber?:string, accountName?:string, idempotencyKey?:string} $options
+     * @param array{amountCents?:int, wallet?:string, channelId?:string, destinationType?:string, phone?:string, shortCode?:string, accountRef?:string, bankCode?:string, accountNumber?:string, accountName?:string, idempotencyKey?:string} $options
      * @return array<string,mixed>
      */
     public function createPayout($amountKes, array $options = []): array
     {
-        $cents = self::toCents($amountKes);
+        $cents = self::toPayoutCents($amountKes, $options['amountCents'] ?? null);
         if ($cents < self::PAYOUT_MIN_CENTS) {
             throw new CyzoraException('The smallest payout is KES 30.');
         }
         $body = ['amount' => $cents];
-        if (!empty($options['wallet'])) {
-            $body['wallet'] = $options['wallet'];
+        $wallet = $options['wallet'] ?? (getenv('CYZORA_PAYOUT_WALLET') ?: null);
+        if ($wallet) {
+            $body['wallet'] = $wallet;
         }
         if (!empty($options['channelId'])) {
             $body['channel_id'] = $options['channelId'];
         } else {
             $type = $options['destinationType'] ?? 'mobile';
             $body['destination_type'] = $type;
+            $require = static function (string $field, $value) use ($type): void {
+                if ($value === null || $value === '') {
+                    throw new CyzoraException($field . ' is required for ' . $type . ' payouts.');
+                }
+            };
             if ($type === 'mobile') {
-                $body['phone'] = self::normalizePhone((string)($options['phone'] ?? '')) ?? ($options['phone'] ?? null);
+                $phone = self::normalizePhone((string)($options['phone'] ?? ''));
+                if ($phone === null) {
+                    throw new CyzoraException('phone must be a valid M-Pesa number for mobile payouts.');
+                }
+                $body['phone'] = $phone;
             } elseif ($type === 'till') {
-                $body['short_code'] = $options['shortCode'] ?? null;
+                $require('shortCode', $options['shortCode'] ?? null);
+                $body['short_code'] = $options['shortCode'];
             } elseif ($type === 'paybill') {
-                $body['short_code'] = $options['shortCode'] ?? null;
-                $body['account_ref'] = $options['accountRef'] ?? null;
+                $require('shortCode', $options['shortCode'] ?? null);
+                $require('accountRef', $options['accountRef'] ?? null);
+                $body['short_code'] = $options['shortCode'];
+                $body['account_ref'] = $options['accountRef'];
             } elseif ($type === 'bank') {
-                $body['bank_code'] = $options['bankCode'] ?? null;
-                $body['account_number'] = $options['accountNumber'] ?? null;
-                $body['account_name'] = $options['accountName'] ?? null;
+                $require('bankCode', $options['bankCode'] ?? null);
+                $require('accountNumber', $options['accountNumber'] ?? null);
+                $require('accountName', $options['accountName'] ?? null);
+                $body['bank_code'] = $options['bankCode'];
+                $body['account_number'] = $options['accountNumber'];
+                $body['account_name'] = $options['accountName'];
+            } else {
+                throw new CyzoraException('destinationType must be mobile, till, paybill or bank.');
             }
         }
         return $this->request('/payouts', 'POST', $body, $options['idempotencyKey'] ?? null);
@@ -284,6 +332,12 @@ class Client
     public function getPayout(string $payoutId): array
     {
         return $this->request('/payouts/' . rawurlencode($payoutId));
+    }
+
+    /** @return array<string,mixed> */
+    public function listPayouts(?array $query = null): array
+    {
+        return $this->request('/payouts', 'GET', null, null, $query);
     }
 
     /** @return array<string,mixed> */
@@ -304,10 +358,18 @@ class Client
         return $this->request('/payout-banks');
     }
 
-    /** @return array<string,mixed> */
-    public function payoutFeePreview($amountKes, string $destinationType = 'mobile'): array
+    /** Preview the fee using the rail's `destination` parameter and the payout wallet. */
+    public function payoutFeePreview($amountKes, string $destinationType = 'mobile', ?string $wallet = null): array
     {
-        return $this->request('/payouts/fee-preview', 'GET', null, null, ['amount' => self::toCents($amountKes), 'destination_type' => $destinationType]);
+        return $this->request('/payouts/fee-preview', 'GET', null, null, [
+            'amount' => self::toPayoutCents($amountKes), 'destination' => $destinationType, 'wallet' => $wallet,
+        ]);
+    }
+
+    /** Verify a 12-character statement code; this public endpoint needs no API key. */
+    public function verifyStatement(string $code): array
+    {
+        return $this->request('/public/statements/verify/' . rawurlencode($code), 'GET', null, null, null, false);
     }
 
     // -- webhooks ---------------------------------------------------------
@@ -338,7 +400,7 @@ class Client
      *
      * @return array<string,mixed>
      */
-    public function constructWebhookEvent(string $rawBody, ?string $signature): array
+    public function constructWebhookEvent(string $rawBody, ?string $signature, ?string $eventHeader = null): array
     {
         if (!$this->verifyWebhookSignature($rawBody, $signature)) {
             throw new CyzoraException('Webhook signature verification failed', 401);
@@ -346,6 +408,9 @@ class Client
         $decoded = json_decode($rawBody, true);
         if (!is_array($decoded)) {
             throw new CyzoraException('Webhook body is not valid JSON', 400);
+        }
+        if ($eventHeader !== null && $eventHeader !== '' && ($decoded['event'] ?? null) !== $eventHeader) {
+            throw new CyzoraException('Webhook event header does not match the body', 400);
         }
         return $decoded;
     }

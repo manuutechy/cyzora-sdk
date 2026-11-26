@@ -22,14 +22,15 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
 )
 
 const (
-	DefaultBaseURL   = "https://api.cyzora.co.ke/api/v1"
-	PayoutMinCents   = 3000 // KES 30
+	DefaultBaseURL = "https://api.cyzora.co.ke/api/v1"
+	PayoutMinCents = 3000 // KES 30
 )
 
 // Error is returned for any non-2xx response or transport failure.
@@ -56,6 +57,7 @@ const (
 	EventChargeExpired   = "charge.expired"
 	EventPayoutPaid      = "payout.paid"
 	EventPayoutFailed    = "payout.failed"
+	EventWebhookTest     = "webhook.test"
 )
 
 type Option func(*Client)
@@ -78,13 +80,22 @@ func WithMaxRetries(n int) Option {
 	return func(c *Client) { c.maxRetries = n }
 }
 
-// New builds a Cyzora client. secretKey is the sk_live_... key.
+// New builds a Cyzora client. secretKey is the sk_live_... key. Base URL and
+// webhook secrets default to CYZORA_API_BASE and CYZORA_WEBHOOK_SECRET.
 func New(secretKey string, opts ...Option) *Client {
 	c := &Client{
 		secretKey:  secretKey,
 		baseURL:    DefaultBaseURL,
 		http:       &http.Client{Timeout: 30 * time.Second},
 		maxRetries: 2,
+	}
+	if base := os.Getenv("CYZORA_API_BASE"); base != "" {
+		c.baseURL = strings.TrimRight(base, "/")
+	}
+	for _, secret := range strings.Split(os.Getenv("CYZORA_WEBHOOK_SECRET"), ",") {
+		if secret = strings.TrimSpace(secret); secret != "" {
+			c.webhookSecrets = append(c.webhookSecrets, secret)
+		}
 	}
 	for _, o := range opts {
 		o(c)
@@ -117,19 +128,41 @@ func NormalizePhone(phone string) string {
 	return ""
 }
 
-// ToCents converts shillings to integer cents, rounding to whole shillings first.
+// ToCents converts shillings to cents, rounding up to the next whole shilling as
+// the rail does for charges and checkout sessions.
 func ToCents(amountKes float64) (int64, error) {
-	kes := int64(math.Round(amountKes))
+	if math.IsNaN(amountKes) || math.IsInf(amountKes, 0) {
+		return 0, &Error{Message: "amount must be a number"}
+	}
+	kes := int64(math.Ceil(amountKes))
 	if kes < 1 {
 		return 0, &Error{Message: "amount must be at least KES 1"}
 	}
 	return kes * 100, nil
 }
 
+// payoutCents rejects fractional shillings, which the rail refuses for payouts.
+func payoutCents(amountKes float64, amountCents int64) (int64, error) {
+	cents := amountCents
+	if cents == 0 {
+		if math.IsNaN(amountKes) || math.IsInf(amountKes, 0) {
+			return 0, &Error{Message: "amount must be a number"}
+		}
+		cents = int64(amountKes * 100)
+	}
+	if cents%100 != 0 {
+		return 0, &Error{Message: "payout amounts must be whole shillings (a multiple of 100 cents)"}
+	}
+	if cents < 100 {
+		return 0, &Error{Message: "amount must be at least KES 1"}
+	}
+	return cents, nil
+}
+
 // FromCents converts integer cents back to shillings.
 func FromCents(cents int64) float64 { return float64(cents) / 100 }
 
-func (c *Client) do(ctx context.Context, method, path string, body interface{}, idempotencyKey string, query map[string]string, out interface{}) error {
+func (c *Client) do(ctx context.Context, method, path string, body interface{}, idempotencyKey string, query map[string]string, out interface{}, auth bool) error {
 	u := c.baseURL + path
 	if len(query) > 0 {
 		q := url.Values{}
@@ -166,7 +199,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 		if err != nil {
 			return err
 		}
-		req.Header.Set("X-API-Key", c.secretKey)
+		if auth {
+			req.Header.Set("X-API-Key", c.secretKey)
+		}
 		req.Header.Set("Accept", "application/json")
 		if bodyBytes != nil {
 			req.Header.Set("Content-Type", "application/json")
@@ -191,7 +226,9 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 			_ = json.Unmarshal(raw, &data)
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			transient := resp.StatusCode >= 500 || resp.StatusCode == 429
+			// A 409 with an idempotency key means the earlier request is still
+			// being processed; the docs advise waiting and retrying with it.
+			transient := resp.StatusCode >= 500 || resp.StatusCode == 429 || (resp.StatusCode == 409 && idempotencyKey != "")
 			if transient && canRetry && attempt < c.maxRetries {
 				time.Sleep(time.Duration(250*(1<<attempt)) * time.Millisecond)
 				continue
@@ -205,6 +242,11 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 			return &Error{Message: msg, Status: resp.StatusCode, Body: data}
 		}
 		if out != nil && len(raw) > 0 {
+			// CSV exports are text, not JSON.
+			if text, ok := out.(*string); ok {
+				*text = string(raw)
+				return nil
+			}
 			return json.Unmarshal(raw, out)
 		}
 		return nil
@@ -215,7 +257,15 @@ func (c *Client) do(ctx context.Context, method, path string, body interface{}, 
 // before this SDK ships a typed wrapper. path is appended to the base URL.
 func (c *Client) Request(ctx context.Context, method, path string, body interface{}, idempotencyKey string, query map[string]string) (map[string]interface{}, error) {
 	out := map[string]interface{}{}
-	err := c.do(ctx, method, path, body, idempotencyKey, query, &out)
+	err := c.do(ctx, method, path, body, idempotencyKey, query, &out, true)
+	return out, err
+}
+
+// PublicRequest calls an endpoint that needs no secret key, such as statement
+// verification. It follows the same retry and parsing rules as Request.
+func (c *Client) PublicRequest(ctx context.Context, method, path string, query map[string]string) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, method, path, nil, "", query, &out, false)
 	return out, err
 }
 
@@ -235,7 +285,7 @@ type ChargeParams struct {
 func (c *Client) CreateCharge(ctx context.Context, p ChargeParams) (map[string]interface{}, error) {
 	phone := NormalizePhone(p.Phone)
 	if phone == "" {
-		return nil, &Error{Message: "enter a valid Safaricom phone number (e.g. 0712 345 678)"}
+		return nil, &Error{Message: "enter a valid M-Pesa phone number (e.g. 0712 345 678)"}
 	}
 	cents := p.AmountCents
 	if cents == 0 {
@@ -243,6 +293,8 @@ func (c *Client) CreateCharge(ctx context.Context, p ChargeParams) (map[string]i
 		if cents, err = ToCents(p.AmountKes); err != nil {
 			return nil, err
 		}
+	} else {
+		cents = ((cents + 99) / 100) * 100 // the rail rounds odd cents up for charges
 	}
 	if cents < 100 {
 		return nil, &Error{Message: "amount must be a whole number of shillings, at least KES 1"}
@@ -262,35 +314,93 @@ func (c *Client) CreateCharge(ctx context.Context, p ChargeParams) (map[string]i
 		body["metadata"] = p.Metadata
 	}
 	out := map[string]interface{}{}
-	err := c.do(ctx, http.MethodPost, "/charges", body, p.IdempotencyKey, nil, &out)
+	err := c.do(ctx, http.MethodPost, "/charges", body, p.IdempotencyKey, nil, &out, true)
+	return out, err
+}
+
+// ExportCharges downloads charges as CSV; from/to are dates such as 2026-10-01.
+func (c *Client) ExportCharges(ctx context.Context, query map[string]string) (string, error) {
+	out := ""
+	err := c.do(ctx, http.MethodGet, "/charges/export", nil, "", query, &out, true)
 	return out, err
 }
 
 // GetCharge fetches a charge by id.
 func (c *Client) GetCharge(ctx context.Context, chargeID string) (map[string]interface{}, error) {
 	out := map[string]interface{}{}
-	err := c.do(ctx, http.MethodGet, "/charges/"+url.PathEscape(chargeID), nil, "", nil, &out)
+	err := c.do(ctx, http.MethodGet, "/charges/"+url.PathEscape(chargeID), nil, "", nil, &out, true)
+	return out, err
+}
+
+// CheckoutParams describes a hosted checkout session.
+type CheckoutParams struct {
+	AmountKes      float64
+	AccountRef     string
+	Description    string
+	CallbackURL    string
+	CancelURL      string
+	CustomerPhone  string
+	CustomerEmail  string
+	Metadata       map[string]interface{}
+	ExpiresIn      int
+	IdempotencyKey string
+}
+
+// CreateCheckoutSession starts a hosted checkout session on the rail.
+func (c *Client) CreateCheckoutSession(ctx context.Context, p CheckoutParams) (map[string]interface{}, error) {
+	cents, err := ToCents(p.AmountKes)
+	if err != nil {
+		return nil, err
+	}
+	body := map[string]interface{}{"amount": cents}
+	if p.AccountRef != "" {
+		body["account_ref"] = trunc(p.AccountRef, 64)
+	}
+	if p.Description != "" {
+		body["description"] = trunc(p.Description, 200)
+	}
+	if p.CallbackURL != "" {
+		body["callback_url"] = p.CallbackURL
+	}
+	if p.CancelURL != "" {
+		body["cancel_url"] = p.CancelURL
+	}
+	if p.CustomerPhone != "" {
+		body["customer_phone"] = orDefault(NormalizePhone(p.CustomerPhone), p.CustomerPhone)
+	}
+	if p.CustomerEmail != "" {
+		body["customer_email"] = p.CustomerEmail
+	}
+	if p.Metadata != nil {
+		body["metadata"] = p.Metadata
+	}
+	if p.ExpiresIn != 0 {
+		body["expires_in"] = p.ExpiresIn
+	}
+	out := map[string]interface{}{}
+	err = c.do(ctx, http.MethodPost, "/transactions/initialize", body, p.IdempotencyKey, nil, &out, true)
 	return out, err
 }
 
 // PayoutParams describes sending money out of the platform balance.
 type PayoutParams struct {
-	AmountKes      float64
-	Wallet         string
-	ChannelID      string
+	AmountKes       float64
+	AmountCents     int64
+	Wallet          string
+	ChannelID       string
 	DestinationType string // mobile | till | paybill | bank
-	Phone          string
-	ShortCode      string
-	AccountRef     string
-	BankCode       string
-	AccountNumber  string
-	AccountName    string
-	IdempotencyKey string
+	Phone           string
+	ShortCode       string
+	AccountRef      string
+	BankCode        string
+	AccountNumber   string
+	AccountName     string
+	IdempotencyKey  string
 }
 
 // CreatePayout sends money to a mobile/till/paybill/bank destination.
 func (c *Client) CreatePayout(ctx context.Context, p PayoutParams) (map[string]interface{}, error) {
-	cents, err := ToCents(p.AmountKes)
+	cents, err := payoutCents(p.AmountKes, p.AmountCents)
 	if err != nil {
 		return nil, err
 	}
@@ -298,8 +408,12 @@ func (c *Client) CreatePayout(ctx context.Context, p PayoutParams) (map[string]i
 		return nil, &Error{Message: "the smallest payout is KES 30"}
 	}
 	body := map[string]interface{}{"amount": cents}
-	if p.Wallet != "" {
-		body["wallet"] = p.Wallet
+	wallet := p.Wallet
+	if wallet == "" {
+		wallet = os.Getenv("CYZORA_PAYOUT_WALLET")
+	}
+	if wallet != "" {
+		body["wallet"] = wallet
 	}
 	if p.ChannelID != "" {
 		body["channel_id"] = p.ChannelID
@@ -308,42 +422,101 @@ func (c *Client) CreatePayout(ctx context.Context, p PayoutParams) (map[string]i
 		body["destination_type"] = t
 		switch t {
 		case "mobile":
-			body["phone"] = orDefault(NormalizePhone(p.Phone), p.Phone)
+			phone := NormalizePhone(p.Phone)
+			if phone == "" {
+				return nil, &Error{Message: "phone must be a valid M-Pesa number for mobile payouts"}
+			}
+			body["phone"] = phone
 		case "till":
+			if p.ShortCode == "" {
+				return nil, &Error{Message: "short_code is required for till payouts"}
+			}
 			body["short_code"] = p.ShortCode
 		case "paybill":
+			if p.ShortCode == "" || p.AccountRef == "" {
+				return nil, &Error{Message: "short_code and account_ref are required for paybill payouts"}
+			}
 			body["short_code"] = p.ShortCode
 			body["account_ref"] = p.AccountRef
 		case "bank":
+			if p.BankCode == "" || p.AccountNumber == "" || p.AccountName == "" {
+				return nil, &Error{Message: "bank_code, account_number and account_name are required for bank payouts"}
+			}
 			body["bank_code"] = p.BankCode
 			body["account_number"] = p.AccountNumber
 			body["account_name"] = p.AccountName
+		default:
+			return nil, &Error{Message: "destination_type must be mobile, till, paybill or bank"}
 		}
 	}
 	out := map[string]interface{}{}
-	err = c.do(ctx, http.MethodPost, "/payouts", body, p.IdempotencyKey, nil, &out)
+	err = c.do(ctx, http.MethodPost, "/payouts", body, p.IdempotencyKey, nil, &out, true)
+	return out, err
+}
+
+// GetPayout fetches a payout by id.
+func (c *Client) GetPayout(ctx context.Context, payoutID string) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/payouts/"+url.PathEscape(payoutID), nil, "", nil, &out, true)
+	return out, err
+}
+
+// ListPayouts lists payouts, optionally filtered by from, to and status.
+func (c *Client) ListPayouts(ctx context.Context, query map[string]string) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/payouts", nil, "", query, &out, true)
 	return out, err
 }
 
 // GetWallets returns balances (in cents) for collections, collections_pending and payouts.
 func (c *Client) GetWallets(ctx context.Context) (map[string]interface{}, error) {
 	out := map[string]interface{}{}
-	err := c.do(ctx, http.MethodGet, "/wallets", nil, "", nil, &out)
+	err := c.do(ctx, http.MethodGet, "/wallets", nil, "", nil, &out, true)
+	return out, err
+}
+
+// ListPayoutChannels returns saved, verified payout destinations.
+func (c *Client) ListPayoutChannels(ctx context.Context) (map[string]interface{}, error) {
+	out := map[string]interface{}{}
+	err := c.do(ctx, http.MethodGet, "/payout-channels", nil, "", nil, &out, true)
 	return out, err
 }
 
 // ListPayoutBanks returns the banks the rail can pay.
 func (c *Client) ListPayoutBanks(ctx context.Context) (map[string]interface{}, error) {
 	out := map[string]interface{}{}
-	err := c.do(ctx, http.MethodGet, "/payout-banks", nil, "", nil, &out)
+	err := c.do(ctx, http.MethodGet, "/payout-banks", nil, "", nil, &out, true)
+	return out, err
+}
+
+// PayoutFeePreview previews the provider fee with the rail's `destination`
+// parameter and the same wallet the payout will use.
+func (c *Client) PayoutFeePreview(ctx context.Context, amountKes float64, destinationType, wallet string) (map[string]interface{}, error) {
+	cents, err := payoutCents(amountKes, 0)
+	if err != nil {
+		return nil, err
+	}
+	query := map[string]string{
+		"amount":      fmt.Sprintf("%d", cents),
+		"destination": orDefault(destinationType, "mobile"),
+		"wallet":      wallet,
+	}
+	out := map[string]interface{}{}
+	err = c.do(ctx, http.MethodGet, "/payouts/fee-preview", nil, "", query, &out, true)
 	return out, err
 }
 
 // VerifyTransaction verifies a hosted-checkout transaction by reference.
 func (c *Client) VerifyTransaction(ctx context.Context, reference string) (map[string]interface{}, error) {
 	out := map[string]interface{}{}
-	err := c.do(ctx, http.MethodGet, "/transactions/verify/"+url.PathEscape(reference), nil, "", nil, &out)
+	err := c.do(ctx, http.MethodGet, "/transactions/verify/"+url.PathEscape(reference), nil, "", nil, &out, true)
 	return out, err
+}
+
+// VerifyStatement verifies a 12-character statement code. This public endpoint
+// needs no secret key.
+func (c *Client) VerifyStatement(ctx context.Context, code string) (map[string]interface{}, error) {
+	return c.PublicRequest(ctx, http.MethodGet, "/public/statements/verify/"+url.PathEscape(code), nil)
 }
 
 // VerifyWebhookSignature checks X-Cyzora-Signature (hex HMAC-SHA256 of the raw body)
@@ -368,14 +541,18 @@ func (c *Client) VerifyWebhookSignature(rawBody []byte, signature string) bool {
 
 // ConstructWebhookEvent verifies the signature (against every configured secret)
 // and parses the body in one call. It returns an error if the signature is invalid
-// or the body is not JSON. rawBody must be the exact bytes received.
-func (c *Client) ConstructWebhookEvent(rawBody []byte, signature string) (map[string]interface{}, error) {
+// or the body is not JSON. rawBody must be the exact bytes received. When an
+// X-Cyzora-Event header is passed, it must agree with the event in the body.
+func (c *Client) ConstructWebhookEvent(rawBody []byte, signature string, eventHeader ...string) (map[string]interface{}, error) {
 	if !c.VerifyWebhookSignature(rawBody, signature) {
 		return nil, &Error{Message: "webhook signature verification failed", Status: 401}
 	}
 	var out map[string]interface{}
 	if err := json.Unmarshal(rawBody, &out); err != nil {
 		return nil, &Error{Message: "webhook body is not valid JSON", Status: 400}
+	}
+	if len(eventHeader) > 0 && eventHeader[0] != "" && out["event"] != eventHeader[0] {
+		return nil, &Error{Message: "webhook event header does not match the body", Status: 400}
 	}
 	return out, nil
 }

@@ -17,6 +17,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
+import os
 import re
 import time
 import urllib.error
@@ -25,7 +27,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Union
 
 __all__ = [
-    "Cyzora", "CyzoraError", "normalize_phone", "to_cents", "from_cents",
+    "Cyzora", "CyzoraError", "normalize_phone", "to_cents", "to_payout_cents", "from_cents",
     "PAYOUT_MIN_CENTS", "WEBHOOK_EVENTS",
 ]
 
@@ -39,6 +41,7 @@ WEBHOOK_EVENTS = {
     "charge_expired": "charge.expired",
     "payout_paid": "payout.paid",
     "payout_failed": "payout.failed",
+    "webhook_test": "webhook.test",
 }
 
 _PHONE_RE = re.compile(r"^254[17]\d{8}$")
@@ -67,11 +70,24 @@ def normalize_phone(phone: str) -> Optional[str]:
 
 
 def to_cents(amount_kes: Union[int, float]) -> int:
-    """Convert shillings to integer cents, rounding to whole shillings first."""
-    kes = round(float(amount_kes))
+    """Convert shillings to cents, rounding up to a whole shilling as the rail does for charges."""
+    value = float(amount_kes)
+    if not math.isfinite(value):
+        raise CyzoraError("Amount must be a number.")
+    kes = math.ceil(value)
     if kes < 1:
         raise CyzoraError("Amount must be at least KES 1.")
     return kes * 100
+
+
+def to_payout_cents(amount_kes: Union[int, float], amount_cents: Optional[int] = None) -> int:
+    """Reject fractional shillings, which the rail refuses for payouts."""
+    cents = float(amount_cents) if amount_cents is not None else float(amount_kes) * 100
+    if not math.isfinite(cents) or not cents.is_integer() or int(cents) % 100 != 0:
+        raise CyzoraError("Payout amounts must be whole shillings (a multiple of 100 cents).")
+    if cents < 1:
+        raise CyzoraError("Amount must be at least KES 1.")
+    return int(cents)
 
 
 def from_cents(cents: Union[int, float]) -> float:
@@ -83,7 +99,7 @@ class Cyzora:
     def __init__(
         self,
         secret_key: str,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: Optional[str] = None,
         webhook_secret: Optional[Union[str, List[str]]] = None,
         timeout: float = 30.0,
         max_retries: int = 2,
@@ -91,11 +107,12 @@ class Cyzora:
         if not secret_key:
             raise CyzoraError("secret_key is required")
         self.secret_key = secret_key
-        self.base_url = base_url.rstrip("/")
+        self.base_url = (base_url or os.environ.get("CYZORA_API_BASE") or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
         if webhook_secret is None:
-            self.webhook_secrets: List[str] = []
+            configured = os.environ.get("CYZORA_WEBHOOK_SECRET")
+            self.webhook_secrets: List[str] = [s.strip() for s in configured.split(",") if s.strip()] if configured else []
         elif isinstance(webhook_secret, str):
             self.webhook_secrets = [webhook_secret]
         else:
@@ -109,13 +126,17 @@ class Cyzora:
         body: Optional[Dict[str, Any]] = None,
         idempotency_key: Optional[str] = None,
         query: Optional[Dict[str, Any]] = None,
+        auth: bool = True,
+        raw: bool = False,
     ) -> Any:
         url = f"{self.base_url}{path}"
         if query:
             clean = {k: v for k, v in query.items() if v not in (None, "")}
             if clean:
                 url += "?" + urllib.parse.urlencode(clean)
-        headers = {"X-API-Key": self.secret_key, "Accept": "application/json"}
+        headers = {"Accept": "application/json"}
+        if auth:
+            headers["X-API-Key"] = self.secret_key
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
@@ -149,20 +170,26 @@ class Cyzora:
                 except json.JSONDecodeError:
                     parsed = {"raw": text}
             if status < 200 or status >= 300:
-                transient = status >= 500 or status == 429
+                # A 409 with an idempotency key means the first request is still
+                # being processed; the docs advise waiting and retrying with it.
+                transient = status >= 500 or status == 429 or (status == 409 and bool(idempotency_key))
                 if transient and can_retry and attempt < self.max_retries:
                     attempt += 1
                     time.sleep(0.25 * (2 ** (attempt - 1)))
                     continue
                 msg = (parsed or {}).get("error") or (parsed or {}).get("message") or f"Cyzora request failed ({status})"
                 raise CyzoraError(msg, status, parsed)
+            if raw:
+                return text
             return parsed
 
     def request(self, method: str, path: str, body: Optional[Dict[str, Any]] = None,
-                idempotency_key: Optional[str] = None, query: Optional[Dict[str, Any]] = None) -> Any:
+                idempotency_key: Optional[str] = None, query: Optional[Dict[str, Any]] = None,
+                auth: bool = True, raw: bool = False) -> Any:
         """Escape hatch for any endpoint, including new ones the rail adds before
         this SDK ships a typed wrapper. `path` is appended to the base URL."""
-        return self._request(path, method=method, body=body, idempotency_key=idempotency_key, query=query)
+        return self._request(path, method=method, body=body, idempotency_key=idempotency_key,
+                             query=query, auth=auth, raw=raw)
 
     # -- charges -----------------------------------------------------------
     def create_charge(
@@ -179,8 +206,8 @@ class Cyzora:
         """Send an M-Pesa STK prompt to a customer's phone."""
         normalized = normalize_phone(phone)
         if not normalized:
-            raise CyzoraError("Enter a valid Safaricom phone number (e.g. 0712 345 678).")
-        cents = int(amount_cents) if amount_cents is not None else to_cents(amount_kes)
+            raise CyzoraError("Enter a valid M-Pesa phone number (e.g. 0712 345 678).")
+        cents = math.ceil(int(amount_cents) / 100) * 100 if amount_cents is not None else to_cents(amount_kes)
         if cents < 100:
             raise CyzoraError("Amount must be a whole number of shillings, at least KES 1.")
         body: Dict[str, Any] = {"amount": cents, "phone": normalized, "network": network}
@@ -194,6 +221,10 @@ class Cyzora:
 
     def get_charge(self, charge_id: str) -> Any:
         return self._request(f"/charges/{urllib.parse.quote(charge_id, safe='')}")
+
+    def export_charges(self, query: Optional[Dict[str, Any]] = None) -> str:
+        """Download charges as CSV; from/to are dates such as 2026-10-01."""
+        return self._request("/charges/export", query=query or {}, raw=True)
 
     def create_checkout_session(
         self,
@@ -245,33 +276,53 @@ class Cyzora:
         account_number: Optional[str] = None,
         account_name: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        amount_cents: Optional[int] = None,
     ) -> Any:
         """Send money out of the platform balance to a mobile/till/paybill/bank destination."""
-        cents = to_cents(amount_kes)
+        cents = to_payout_cents(amount_kes, amount_cents)
         if cents < PAYOUT_MIN_CENTS:
             raise CyzoraError("The smallest payout is KES 30.")
         body: Dict[str, Any] = {"amount": cents}
+        wallet = wallet or os.environ.get("CYZORA_PAYOUT_WALLET")
         if wallet:
             body["wallet"] = wallet
         if channel_id:
             body["channel_id"] = channel_id
         else:
             body["destination_type"] = destination_type
+            def require(field: str, value: Any) -> None:
+                if value is None or str(value) == "":
+                    raise CyzoraError(f"{field} is required for {destination_type} payouts.")
+
             if destination_type == "mobile":
-                body["phone"] = normalize_phone(phone or "") or phone
+                normalized = normalize_phone(phone or "")
+                if not normalized:
+                    raise CyzoraError("phone must be a valid M-Pesa number for mobile payouts.")
+                body["phone"] = normalized
             elif destination_type == "till":
+                require("short_code", short_code)
                 body["short_code"] = short_code
             elif destination_type == "paybill":
+                require("short_code", short_code)
+                require("account_ref", account_ref)
                 body["short_code"] = short_code
                 body["account_ref"] = account_ref
             elif destination_type == "bank":
+                require("bank_code", bank_code)
+                require("account_number", account_number)
+                require("account_name", account_name)
                 body["bank_code"] = bank_code
                 body["account_number"] = account_number
                 body["account_name"] = account_name
+            else:
+                raise CyzoraError("destination_type must be mobile, till, paybill or bank.")
         return self._request("/payouts", "POST", body, idempotency_key)
 
     def get_payout(self, payout_id: str) -> Any:
         return self._request(f"/payouts/{urllib.parse.quote(payout_id, safe='')}")
+
+    def list_payouts(self, query: Optional[Dict[str, Any]] = None) -> Any:
+        return self._request("/payouts", query=query or {})
 
     def get_wallets(self) -> Any:
         """Balances (in cents) for collections, collections_pending and payouts wallets."""
@@ -283,8 +334,16 @@ class Cyzora:
     def list_payout_banks(self) -> Any:
         return self._request("/payout-banks")
 
-    def payout_fee_preview(self, amount_kes: Union[int, float], destination_type: str = "mobile") -> Any:
-        return self._request("/payouts/fee-preview", query={"amount": to_cents(amount_kes), "destination_type": destination_type})
+    def payout_fee_preview(self, amount_kes: Union[int, float], destination_type: str = "mobile",
+                           wallet: Optional[str] = None) -> Any:
+        """Preview the fee using the rail's `destination` parameter and the payout wallet."""
+        return self._request("/payouts/fee-preview", query={
+            "amount": to_payout_cents(amount_kes), "destination": destination_type, "wallet": wallet,
+        })
+
+    def verify_statement(self, code: str) -> Any:
+        """Verify a 12-character statement code; this public endpoint needs no API key."""
+        return self._request(f"/public/statements/verify/{urllib.parse.quote(code, safe='')}", auth=False)
 
     # -- webhooks ----------------------------------------------------------
     def verify_webhook_signature(self, raw_body: Union[str, bytes], signature: Optional[str]) -> bool:
@@ -303,16 +362,21 @@ class Cyzora:
                 return True
         return False
 
-    def construct_webhook_event(self, raw_body: Union[str, bytes], signature: Optional[str]) -> Any:
+    def construct_webhook_event(self, raw_body: Union[str, bytes], signature: Optional[str],
+                                event_header: Optional[str] = None) -> Any:
         """
         Verify the signature (against every configured secret) and parse the body in
         one call. Raises CyzoraError if the signature is invalid or the body is not
-        JSON. `raw_body` must be the exact bytes received.
+        JSON. `raw_body` must be the exact bytes received. When `event_header` is the
+        X-Cyzora-Event value, it must agree with the event in the body.
         """
         if not self.verify_webhook_signature(raw_body, signature):
             raise CyzoraError("Webhook signature verification failed", 401)
         body = raw_body.decode("utf-8") if isinstance(raw_body, (bytes, bytearray)) else raw_body
         try:
-            return json.loads(body)
+            event = json.loads(body)
         except json.JSONDecodeError:
             raise CyzoraError("Webhook body is not valid JSON", 400)
+        if event_header and isinstance(event, dict) and event.get("event") != event_header:
+            raise CyzoraError("Webhook event header does not match the body", 400)
+        return event
