@@ -14,7 +14,8 @@ idempotency key, and the smallest payout is KES 30.
 
 ## Requirements and installation
 
-Node.js 18 or newer is required because the client uses global `fetch`.
+Node.js 18 or newer is required because the client uses global `fetch`. The package is
+ESM only, so consumers should use `import` rather than `require`.
 
 ```bash
 npm install cyzora
